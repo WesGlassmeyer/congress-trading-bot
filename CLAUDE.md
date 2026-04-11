@@ -23,6 +23,7 @@ Priority order in `fetch_recent_disclosures()`:
 | 4 | Capitol Trades BFF (`bff.capitoltrades.com`) | **503** — CloudFront/Lambda error | Down since 2026-04-10 |
 
 **House Clerk PTR is the live data source.** No API key required.
+
 ## Environment Variables (`.env`)
 ```
 ALPACA_API_KEY=
@@ -31,15 +32,6 @@ ALPACA_BASE_URL=https://paper-api.alpaca.markets
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ANTHROPIC_API_KEY=
-```
-```
-ALPACA_API_KEY=
-ALPACA_SECRET_KEY=
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-ANTHROPIC_API_KEY=
-QUIVER_API_KEY=        # required — not yet set
 ```
 
 ## Politician Scoring

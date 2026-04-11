@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /root/congress-trading-bot/.claude/update-claude-md-hook.sh",
+            "timeout": 60,
+            "statusMessage": "Updating CLAUDE.md..."
+          }
+        ]
+      }
+    ]
+  }
+}
