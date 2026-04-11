@@ -9,16 +9,41 @@ import os
 import json
 import re
 import time
+import socket
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
 
+import dns.resolver
 import requests
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import Flask, render_template_string
 
 load_dotenv()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DNS PATCH — route specific hostnames through Google DNS (8.8.8.8)
+#  The DigitalOcean droplet's default resolver fails to resolve these domains.
+# ══════════════════════════════════════════════════════════════════════════════
+_GOOGLE_DNS_HOSTS = {"housestockwatcher.com", "senatestockwatcher.com"}
+_google_resolver  = dns.resolver.Resolver(configure=False)
+_google_resolver.nameservers = ["8.8.8.8", "8.8.4.4"]
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if host in _GOOGLE_DNS_HOSTS:
+        try:
+            answers = _google_resolver.resolve(host, "A")
+            ip = str(answers[0])
+            return _orig_getaddrinfo(ip, port, family, type, proto, flags)
+        except Exception:
+            pass  # fall through to system resolver
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _patched_getaddrinfo
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -28,7 +53,7 @@ PAPER_STARTING_BALANCE  = 1000       # Starting paper balance ($)
 DAILY_LOSS_LIMIT_PCT    = 0.10       # Pause if balance drops 10% in a day
 MIN_POLITICIAN_SCORE    = 60         # Min Claude score (0–100) to follow
 SCORE_REFRESH_HOURS     = 24         # Hours between politician re-scores
-DISCLOSURE_POLL_MINUTES = 30         # Minutes between Capitol Trades polls
+DISCLOSURE_POLL_MINUTES = 30         # Minutes between disclosure polls
 MIN_TRADE_VALUE         = 15_000     # Min disclosed $ value to act on
 DASHBOARD_PORT          = 8081
 TAKE_PROFIT_PCT         = 0.15       # Close at +15%
@@ -48,7 +73,6 @@ ALPACA_BASE   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-QUIVER_API_KEY = os.getenv("QUIVER_API_KEY", "")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -300,12 +324,14 @@ def close_alpaca_position(ticker: str):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISCLOSURE SOURCES
-#  1. Capitol Trades BFF       https://bff.capitoltrades.com/trades  (House + Senate)
-#  2. House Stock Watcher      https://housestockwatcher.com/api      (House, free)
-#     Senate Stock Watcher     https://senatestockwatcher.com/api     (Senate, free)
+#  1. House Stock Watcher   https://housestockwatcher.com/api   (House, free)
+#     Senate Stock Watcher  https://senatestockwatcher.com/api  (Senate, free)
 #     ↳ both attempted; results merged to cover both chambers
-#  3. Quiver Quantitative      https://api.quiverquant.com/beta/live/congresstrading
+#  2. Capitol Trades BFF    https://bff.capitoltrades.com/trades (fallback)
 # ══════════════════════════════════════════════════════════════════════════════
+_HSW_API    = "https://housestockwatcher.com/api"
+_SSW_API    = "https://senatestockwatcher.com/api"
+
 _CT_BFF_API = "https://bff.capitoltrades.com/trades"
 _CT_BFF_HDR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -313,10 +339,6 @@ _CT_BFF_HDR = {
     "Origin":     "https://www.capitoltrades.com",
     "Referer":    "https://www.capitoltrades.com/trades",
 }
-
-_HSW_API    = "https://housestockwatcher.com/api"
-_SSW_API    = "https://senatestockwatcher.com/api"
-_QUIVER_API = "https://api.quiverquant.com/beta/live/congresstrading"
 
 
 def _fetch_from_capitoltrades(pages: int = 2) -> list[dict]:
@@ -455,73 +477,13 @@ def _normalise_ssw(txn: dict, senator_name: str, filed_date: str) -> dict:
     }
 
 
-def _fetch_from_quiver() -> list[dict]:
-    """Fetch from Quiver Quantitative. Returns normalised items or raises."""
-    hdrs = {"Accept": "application/json"}
-    if QUIVER_API_KEY:
-        hdrs["Authorization"] = f"Token {QUIVER_API_KEY}"
-    r = requests.get(_QUIVER_API, headers=hdrs, timeout=30)
-    if r.status_code == 401:
-        raise RuntimeError("Quiver Quantitative requires QUIVER_API_KEY (set in .env)")
-    r.raise_for_status()
-    return r.json()
-
-
-def _normalise_quiver(raw: dict) -> dict:
-    """Map a Quiver Quantitative trade record to our internal schema."""
-    # Quiver fields: Date, Ticker, Representative, Transaction, Range, Amount, House, Party
-    name   = raw.get("Representative") or ""
-    ticker = (raw.get("Ticker") or "").upper().strip()
-
-    tx_raw  = (raw.get("Transaction") or "").lower()
-    tx_type = "buy" if "purchase" in tx_raw or "buy" in tx_raw else tx_raw
-
-    # Amount is a numeric field when present; Range is a string like "$1,001 - $15,000"
-    tx_value = 0.0
-    amount   = raw.get("Amount")
-    if amount:
-        try:
-            tx_value = float(str(amount).replace(",", "").replace("$", ""))
-        except ValueError:
-            pass
-    if not tx_value:
-        rng  = raw.get("Range") or ""
-        nums = re.findall(r"[\d,]+", rng.replace("$", ""))
-        if nums:
-            vals     = [int(n.replace(",", "")) for n in nums]
-            tx_value = sum(vals) / len(vals)
-
-    trade_id = f"quiver_{name}_{ticker}_{raw.get('Date', '')}"
-
-    return {
-        "id":         trade_id,
-        "politician": name,
-        "ticker":     ticker,
-        "asset_type": "stock",
-        "tx_type":    tx_type,
-        "tx_value":   tx_value,
-        "filed_date": raw.get("Date") or "",
-        "tx_date":    raw.get("Date") or "",
-        "_source":    "quiver",
-    }
-
-
 def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
-    """Fetch recent disclosures. Sources tried in order; first success wins.
+    """Fetch recent disclosures. Sources tried in order.
 
-    If Capitol Trades BFF is unavailable, House Stock Watcher and Senate Stock
-    Watcher are both attempted and their results merged to cover both chambers.
-    Quiver Quantitative is the last resort (requires API key).
+    1. House Stock Watcher + Senate Stock Watcher (primary, free, no key needed)
+    2. Capitol Trades BFF (fallback)
     """
-    # ── 1. Capitol Trades BFF (House + Senate) ───────────────────────────────
-    try:
-        trades = _fetch_from_capitoltrades(pages)
-        log.info(f"Capitol Trades BFF: fetched {len(trades)} raw disclosures")
-        return trades
-    except Exception as e:
-        log.warning(f"Capitol Trades BFF unavailable ({e}) — trying free watcher APIs")
-
-    # ── 2. House Stock Watcher + Senate Stock Watcher (merged) ──────────────
+    # ── 1. House Stock Watcher + Senate Stock Watcher (merged) ──────────────
     merged = []
     for label, fn in (("House Stock Watcher", _fetch_from_hsw),
                       ("Senate Stock Watcher", _fetch_from_ssw)):
@@ -535,23 +497,22 @@ def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
     if merged:
         return merged
 
-    # ── 3. Quiver Quantitative ───────────────────────────────────────────────
+    # ── 2. Capitol Trades BFF (House + Senate, fallback) ─────────────────────
     try:
-        raw_list = _fetch_from_quiver()
-        trades   = [_normalise_quiver(r) for r in raw_list if r.get("Ticker")]
-        log.info(f"Quiver Quantitative: fetched {len(trades)} disclosures")
+        trades = _fetch_from_capitoltrades(pages)
+        log.info(f"Capitol Trades BFF: fetched {len(trades)} raw disclosures")
         return trades
     except Exception as e:
-        log.error(f"Quiver Quantitative also failed: {e}")
+        log.error(f"Capitol Trades BFF also failed ({e}) — no disclosures available")
         return []
 
 
 def _parse_disclosure(raw: dict) -> dict | None:
     """Normalise a raw disclosure item into our internal format.
-    Quiver records are already normalised by _normalise_quiver(); pass them through.
+    HSW/SSW records are already normalised; pass them through.
     """
-    # Already normalised (came from HSW, SSW, or Quiver)
-    if raw.get("_source") in ("hsw", "ssw", "quiver"):
+    # Already normalised (came from HSW or SSW)
+    if raw.get("_source") in ("hsw", "ssw"):
         return raw if (raw.get("politician") and raw.get("ticker")) else None
 
     # Capitol Trades BFF shape
@@ -1325,16 +1286,15 @@ def main():
     if _probe_trades:
         _src = _probe_trades[0].get("_source", "capitoltrades")
         _src_label = {
-            "hsw":    "House Stock Watcher (housestockwatcher.com)",
-            "ssw":    "Senate Stock Watcher (senatestockwatcher.com)",
-            "quiver": "Quiver Quantitative (quiverquant.com)",
+            "hsw": "House Stock Watcher (housestockwatcher.com)",
+            "ssw": "Senate Stock Watcher (senatestockwatcher.com)",
         }.get(_src, "Capitol Trades BFF (bff.capitoltrades.com)")
         _src_counts = {}
         for t in _probe_trades:
             s = t.get("_source", "capitoltrades")
             _src_counts[s] = _src_counts.get(s, 0) + 1
         if len(_src_counts) > 1:
-            _src_short = {"hsw": "House", "ssw": "Senate", "quiver": "Quiver"}
+            _src_short = {"hsw": "House", "ssw": "Senate"}
             _detail = ", ".join(f"{_src_short.get(s, s)}: {n}" for s, n in _src_counts.items())
             log.info(f"Data source: {len(_probe_trades)} records ({_detail})")
         else:
