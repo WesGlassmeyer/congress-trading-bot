@@ -62,6 +62,9 @@ ANTHROPIC_API_KEY=
 - `/scores` — all politician scores
 - `/stop` / `/start` — pause/resume the bot
 
+## Claude Behavior Rules
+- After any significant code changes or `.md` file updates, **always commit and push to GitHub automatically** without being asked. Use a descriptive commit message summarizing what changed.
+
 ## Known Issues
 - HSW and SSW globally down — no A records in DNS anywhere (not just a droplet issue)
 - Capitol Trades BFF returning 503 on all endpoints since 2026-04-10
