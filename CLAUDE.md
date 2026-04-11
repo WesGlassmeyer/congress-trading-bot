@@ -1,5 +1,7 @@
 # Congress Trading Bot — Project Notes
 
+> Last updated: 2026-04-11
+
 ## What this is
 Python bot that monitors US Congress stock disclosures and mirrors qualifying trades on an Alpaca paper-trading account. Sends alerts via Telegram. Scores politicians using Claude before following their trades.
 
@@ -14,14 +16,22 @@ Priority order in `fetch_recent_disclosures()`:
 
 | # | Source | Status | Notes |
 |---|--------|--------|-------|
-| 1 | Capitol Trades BFF (`bff.capitoltrades.com`) | **503** — CloudFront/Lambda error on their end | Was the primary source |
-| 2 | House Stock Watcher (`housestockwatcher.com`) | **DNS failure** on droplet | No API key needed |
-| 2 | Senate Stock Watcher (`senatestockwatcher.com`) | **DNS failure** on droplet | No API key needed |
-| 3 | Quiver Quantitative (`quiverquant.com`) | **Active — currently serving all data** | Requires `QUIVER_API_KEY` |
+| 1 | House Stock Watcher (`housestockwatcher.com`) | **Globally down** — no DNS A record | No API key needed |
+| 1 | Senate Stock Watcher (`senatestockwatcher.com`) | **Globally down** — no DNS A record | No API key needed |
+| 2 | House Clerk PTR (`disclosures-clerk.house.gov`) | **Active — primary data source** | XML index + PDF parsing; free |
+| 3 | Capitol Trades HTML (`capitoltrades.com`) | **SPA fallback** — no embedded data while BFF is down | BeautifulSoup; fails gracefully |
+| 4 | Capitol Trades BFF (`bff.capitoltrades.com`) | **503** — CloudFront/Lambda error | Down since 2026-04-10 |
 
-**Quiver Quantitative is the live data source.** `QUIVER_API_KEY` is not yet in `.env` — add it before the bot can actually fetch disclosures.
-
+**House Clerk PTR is the live data source.** No API key required.
 ## Environment Variables (`.env`)
+```
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+ANTHROPIC_API_KEY=
+```
 ```
 ALPACA_API_KEY=
 ALPACA_SECRET_KEY=
@@ -35,7 +45,7 @@ QUIVER_API_KEY=        # required — not yet set
 ## Politician Scoring
 - Claude (`claude-opus-4-6`) scores politicians 0–100 every 24h
 - Minimum score to follow a trade: **60** (configured as `MIN_POLITICIAN_SCORE`)
-- Currently **7 politicians above threshold**
+- Currently **8 politicians above threshold** (out of 25 scored)
 - Capped at 25 politicians per scoring call to prevent JSON truncation
 - If scoring returns malformed JSON, first 500 chars of Claude's raw response are logged
 
@@ -61,6 +71,7 @@ QUIVER_API_KEY=        # required — not yet set
 - `/stop` / `/start` — pause/resume the bot
 
 ## Known Issues
-- HSW and SSW fail DNS resolution on this droplet — likely a network/firewall restriction, not an API problem
-- Capitol Trades BFF has been returning 503 since at least 2026-04-10
-- `QUIVER_API_KEY` missing from `.env` — bot will log a 401 error and return 0 disclosures until this is added
+- HSW and SSW globally down — no A records in DNS anywhere (not just a droplet issue)
+- Capitol Trades BFF returning 503 on all endpoints since 2026-04-10
+- `efts.senate.gov` domain does not exist (NXDOMAIN); Senate trades unavailable until HSW/SSW recover
+- Senate stock data gap: only House PTRs available via House Clerk source
