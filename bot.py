@@ -35,6 +35,9 @@ TAKE_PROFIT_PCT         = 0.15       # Close at +15%
 STOP_LOSS_PCT           = 0.07       # Close at -7%
 MAX_HOLD_DAYS           = 30         # Auto-close after 30 days
 POSITION_CHECK_MINUTES  = 5          # How often to check open positions
+MAX_OPEN_POSITIONS      = 5          # Never hold more than this many at once
+MAX_POS_PER_POLITICIAN  = 2          # Max concurrent positions per politician
+DISCLOSURE_LOOKBACK_DAYS = 7         # Ignore disclosures filed more than N days ago
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CREDENTIALS
@@ -45,6 +48,7 @@ ALPACA_BASE   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+QUIVER_API_KEY = os.getenv("QUIVER_API_KEY", "")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -295,53 +299,262 @@ def close_alpaca_position(ticker: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CAPITOL TRADES POLLING
+#  DISCLOSURE SOURCES
+#  1. Capitol Trades BFF       https://bff.capitoltrades.com/trades  (House + Senate)
+#  2. House Stock Watcher      https://housestockwatcher.com/api      (House, free)
+#     Senate Stock Watcher     https://senatestockwatcher.com/api     (Senate, free)
+#     ↳ both attempted; results merged to cover both chambers
+#  3. Quiver Quantitative      https://api.quiverquant.com/beta/live/congresstrading
 # ══════════════════════════════════════════════════════════════════════════════
-_CT_API = "https://www.capitoltrades.com/api/trades"
-_CT_HDR = {
-    "Accept":          "application/json, text/plain, */*",
-    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Referer":         "https://www.capitoltrades.com/trades",
-    "Accept-Language": "en-US,en;q=0.9",
+_CT_BFF_API = "https://bff.capitoltrades.com/trades"
+_CT_BFF_HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":     "application/json",
+    "Origin":     "https://www.capitoltrades.com",
+    "Referer":    "https://www.capitoltrades.com/trades",
 }
 
+_HSW_API    = "https://housestockwatcher.com/api"
+_SSW_API    = "https://senatestockwatcher.com/api"
+_QUIVER_API = "https://api.quiverquant.com/beta/live/congresstrading"
 
-def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
-    """Fetch recent disclosures from Capitol Trades API."""
+
+def _fetch_from_capitoltrades(pages: int = 2) -> list[dict]:
+    """Fetch from the Capitol Trades BFF JSON API. Returns raw items or raises."""
     trades = []
     for page in range(1, pages + 1):
-        try:
-            r = requests.get(
-                _CT_API,
-                headers=_CT_HDR,
-                params={"pageSize": 100, "page": page, "sortBy": "-filedAt"},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                log.warning(f"Capitol Trades HTTP {r.status_code} on page {page}")
-                break
-            data = r.json()
-            batch = data.get("data", [])
-            trades.extend(batch)
-            log.debug(f"Capitol Trades page {page}: {len(batch)} trades")
-            # Stop early if we've exhausted pages
-            meta      = data.get("meta", {})
-            pag       = meta.get("pagination", {})
-            page_count = pag.get("pageCount", pag.get("totalPages", 1))
-            if page >= page_count:
-                break
-        except requests.exceptions.JSONDecodeError:
-            log.warning("Capitol Trades returned non-JSON (may be blocked)")
-            break
-        except Exception as e:
-            log.error(f"Capitol Trades fetch error page {page}: {e}")
+        r = requests.get(
+            _CT_BFF_API,
+            headers=_CT_BFF_HDR,
+            params={"page": page, "pageSize": 100},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Capitol Trades BFF HTTP {r.status_code} on page {page}")
+        data  = r.json()
+        batch = data.get("data", [])
+        trades.extend(batch)
+        log.debug(f"Capitol Trades BFF page {page}: {len(batch)} trades")
+        meta       = data.get("meta", {})
+        pag        = meta.get("pagination", {})
+        page_count = pag.get("pageCount", pag.get("totalPages", 1))
+        if page >= page_count:
             break
     return trades
 
 
+def _fetch_from_hsw() -> list[dict]:
+    """Fetch from House Stock Watcher. Returns normalised items or raises.
+
+    Response: flat JSON array of House-only disclosures.
+    Fields of interest: representative, ticker, type, amount, transaction_date,
+                        disclosure_date, asset_description, asset_type.
+    """
+    r = requests.get(_HSW_API, timeout=30)
+    r.raise_for_status()
+    raw_list = r.json()
+    if not isinstance(raw_list, list):
+        raise RuntimeError(f"HSW unexpected response shape: {type(raw_list)}")
+    return [_normalise_hsw(item) for item in raw_list if _hsw_has_ticker(item)]
+
+
+def _hsw_has_ticker(raw: dict) -> bool:
+    ticker = (raw.get("ticker") or "").strip()
+    return bool(ticker) and ticker != "--"
+
+
+def _normalise_hsw(raw: dict) -> dict:
+    """Map a House Stock Watcher record to our internal schema."""
+    name   = (raw.get("representative") or "").strip()
+    ticker = (raw.get("ticker") or "").upper().strip()
+
+    tx_raw  = (raw.get("type") or "").lower()
+    tx_type = "buy" if "purchase" in tx_raw else ("sell" if "sale" in tx_raw else tx_raw)
+
+    # amount is a range string like "$1,001 - $15,000"
+    tx_value = 0.0
+    rng  = raw.get("amount") or ""
+    nums = re.findall(r"[\d,]+", rng.replace("$", ""))
+    if nums:
+        vals     = [int(n.replace(",", "")) for n in nums]
+        tx_value = sum(vals) / len(vals)
+
+    tx_date    = raw.get("transaction_date") or ""
+    filed_date = raw.get("disclosure_date")  or tx_date
+    asset_type = (raw.get("asset_type") or "stock").lower()
+    trade_id   = f"hsw_{name}_{ticker}_{tx_date}"
+
+    return {
+        "id":         trade_id,
+        "politician": name,
+        "ticker":     ticker,
+        "asset_type": asset_type,
+        "tx_type":    tx_type,
+        "tx_value":   tx_value,
+        "filed_date": filed_date,
+        "tx_date":    tx_date,
+        "_source":    "hsw",
+    }
+
+
+def _fetch_from_ssw() -> list[dict]:
+    """Fetch from Senate Stock Watcher. Returns normalised items or raises.
+
+    Response: flat JSON array of senator objects, each with a nested
+    `transactions` list. Fields: first_name, last_name, date_recieved (sic),
+    transactions[].ticker, .type, .amount, .transaction_date, .asset_type.
+    """
+    r = requests.get(_SSW_API, timeout=30)
+    r.raise_for_status()
+    raw_list = r.json()
+    if not isinstance(raw_list, list):
+        raise RuntimeError(f"SSW unexpected response shape: {type(raw_list)}")
+    trades = []
+    for senator in raw_list:
+        first      = (senator.get("first_name") or "").strip()
+        last       = (senator.get("last_name")  or "").strip()
+        name       = f"{first} {last}".strip()
+        filed_date = senator.get("date_recieved") or ""   # field has typo in source
+        for txn in senator.get("transactions") or []:
+            ticker = (txn.get("ticker") or "").upper().strip()
+            if not ticker or ticker == "--":
+                continue
+            trades.append(_normalise_ssw(txn, name, filed_date))
+    return trades
+
+
+def _normalise_ssw(txn: dict, senator_name: str, filed_date: str) -> dict:
+    """Map one Senate Stock Watcher transaction to our internal schema."""
+    ticker = (txn.get("ticker") or "").upper().strip()
+
+    tx_raw  = (txn.get("type") or "").lower()
+    tx_type = "buy" if "purchase" in tx_raw else ("sell" if "sale" in tx_raw else tx_raw)
+
+    # amount is a range string like "$1,001 - $15,000"
+    tx_value = 0.0
+    rng  = txn.get("amount") or ""
+    nums = re.findall(r"[\d,]+", rng.replace("$", ""))
+    if nums:
+        vals     = [int(n.replace(",", "")) for n in nums]
+        tx_value = sum(vals) / len(vals)
+
+    tx_date    = txn.get("transaction_date") or ""
+    asset_type = (txn.get("asset_type") or "stock").lower()
+    trade_id   = f"ssw_{senator_name}_{ticker}_{tx_date}"
+
+    return {
+        "id":         trade_id,
+        "politician": senator_name,
+        "ticker":     ticker,
+        "asset_type": asset_type,
+        "tx_type":    tx_type,
+        "tx_value":   tx_value,
+        "filed_date": filed_date,
+        "tx_date":    tx_date,
+        "_source":    "ssw",
+    }
+
+
+def _fetch_from_quiver() -> list[dict]:
+    """Fetch from Quiver Quantitative. Returns normalised items or raises."""
+    hdrs = {"Accept": "application/json"}
+    if QUIVER_API_KEY:
+        hdrs["Authorization"] = f"Token {QUIVER_API_KEY}"
+    r = requests.get(_QUIVER_API, headers=hdrs, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("Quiver Quantitative requires QUIVER_API_KEY (set in .env)")
+    r.raise_for_status()
+    return r.json()
+
+
+def _normalise_quiver(raw: dict) -> dict:
+    """Map a Quiver Quantitative trade record to our internal schema."""
+    # Quiver fields: Date, Ticker, Representative, Transaction, Range, Amount, House, Party
+    name   = raw.get("Representative") or ""
+    ticker = (raw.get("Ticker") or "").upper().strip()
+
+    tx_raw  = (raw.get("Transaction") or "").lower()
+    tx_type = "buy" if "purchase" in tx_raw or "buy" in tx_raw else tx_raw
+
+    # Amount is a numeric field when present; Range is a string like "$1,001 - $15,000"
+    tx_value = 0.0
+    amount   = raw.get("Amount")
+    if amount:
+        try:
+            tx_value = float(str(amount).replace(",", "").replace("$", ""))
+        except ValueError:
+            pass
+    if not tx_value:
+        rng  = raw.get("Range") or ""
+        nums = re.findall(r"[\d,]+", rng.replace("$", ""))
+        if nums:
+            vals     = [int(n.replace(",", "")) for n in nums]
+            tx_value = sum(vals) / len(vals)
+
+    trade_id = f"quiver_{name}_{ticker}_{raw.get('Date', '')}"
+
+    return {
+        "id":         trade_id,
+        "politician": name,
+        "ticker":     ticker,
+        "asset_type": "stock",
+        "tx_type":    tx_type,
+        "tx_value":   tx_value,
+        "filed_date": raw.get("Date") or "",
+        "tx_date":    raw.get("Date") or "",
+        "_source":    "quiver",
+    }
+
+
+def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
+    """Fetch recent disclosures. Sources tried in order; first success wins.
+
+    If Capitol Trades BFF is unavailable, House Stock Watcher and Senate Stock
+    Watcher are both attempted and their results merged to cover both chambers.
+    Quiver Quantitative is the last resort (requires API key).
+    """
+    # ── 1. Capitol Trades BFF (House + Senate) ───────────────────────────────
+    try:
+        trades = _fetch_from_capitoltrades(pages)
+        log.info(f"Capitol Trades BFF: fetched {len(trades)} raw disclosures")
+        return trades
+    except Exception as e:
+        log.warning(f"Capitol Trades BFF unavailable ({e}) — trying free watcher APIs")
+
+    # ── 2. House Stock Watcher + Senate Stock Watcher (merged) ──────────────
+    merged = []
+    for label, fn in (("House Stock Watcher", _fetch_from_hsw),
+                      ("Senate Stock Watcher", _fetch_from_ssw)):
+        try:
+            batch = fn()
+            log.info(f"{label}: fetched {len(batch)} disclosures")
+            merged.extend(batch)
+        except Exception as e:
+            log.warning(f"{label} unavailable: {e}")
+
+    if merged:
+        return merged
+
+    # ── 3. Quiver Quantitative ───────────────────────────────────────────────
+    try:
+        raw_list = _fetch_from_quiver()
+        trades   = [_normalise_quiver(r) for r in raw_list if r.get("Ticker")]
+        log.info(f"Quiver Quantitative: fetched {len(trades)} disclosures")
+        return trades
+    except Exception as e:
+        log.error(f"Quiver Quantitative also failed: {e}")
+        return []
+
+
 def _parse_disclosure(raw: dict) -> dict | None:
-    """Normalise a raw Capitol Trades item into our internal format."""
+    """Normalise a raw disclosure item into our internal format.
+    Quiver records are already normalised by _normalise_quiver(); pass them through.
+    """
+    # Already normalised (came from HSW, SSW, or Quiver)
+    if raw.get("_source") in ("hsw", "ssw", "quiver"):
+        return raw if (raw.get("politician") and raw.get("ticker")) else None
+
+    # Capitol Trades BFF shape
     try:
         pol    = raw.get("politician") or {}
         issuer = raw.get("issuer") or {}
@@ -400,14 +613,14 @@ def _parse_disclosure(raw: dict) -> dict | None:
 
 
 def poll_disclosures():
-    """Check Capitol Trades for new disclosures and act on qualifying ones."""
-    log.info("Polling Capitol Trades for new disclosures...")
+    """Check disclosure sources for new trades and act on qualifying ones."""
+    log.info("Polling disclosure sources for new trades...")
     try:
         raw_trades = fetch_recent_disclosures(pages=2)
     except Exception as e:
         log.error(f"Disclosure poll failed: {e}")
         return
-    log.info(f"Fetched {len(raw_trades)} raw disclosures from Capitol Trades")
+    log.info(f"Fetched {len(raw_trades)} raw disclosures")
 
     with _lock:
         _check_daily_reset()
@@ -471,6 +684,20 @@ def _evaluate_trade(trade: dict, paused: bool):
         log.debug(f"Skip {ticker}: disclosed ${tx_value:,.0f} < ${MIN_TRADE_VALUE:,}")
         return
 
+    # Age filter — only act on disclosures filed within the lookback window
+    filed = trade.get("filed_date") or trade.get("tx_date") or ""
+    if filed:
+        try:
+            filed_dt = datetime.fromisoformat(filed.replace("Z", "+00:00"))
+            if filed_dt.tzinfo is None:
+                filed_dt = filed_dt.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - filed_dt).days
+            if age_days > DISCLOSURE_LOOKBACK_DAYS:
+                log.debug(f"Skip {ticker}: disclosure filed {age_days}d ago > {DISCLOSURE_LOOKBACK_DAYS}d cutoff")
+                return
+        except Exception:
+            pass  # unparseable date — allow through rather than silently drop
+
     # Politician score gate
     with _lock:
         score_info = state["politician_scores"].get(politician, {})
@@ -484,10 +711,17 @@ def _evaluate_trade(trade: dict, paused: bool):
         log.info(f"Skip {politician}/{ticker}: bot paused")
         return
 
-    # Already have this ticker open
+    # Position-limit checks
     with _lock:
         if ticker in state["positions"]:
             log.info(f"Skip {ticker}: position already open")
+            return
+        if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+            log.info(f"Skip {ticker}: max open positions ({MAX_OPEN_POSITIONS}) reached")
+            return
+        pol_count = sum(1 for p in state["positions"].values() if p["politician"] == politician)
+        if pol_count >= MAX_POS_PER_POLITICIAN:
+            log.info(f"Skip {politician}/{ticker}: per-politician limit ({MAX_POS_PER_POLITICIAN}) reached")
             return
         # Insufficient balance
         if state["balance"] < PAPER_TRADE_SIZE:
@@ -684,8 +918,9 @@ def score_politicians():
             "avg_value":    round(avg_val),
         })
 
-    # Sort by activity for prompt clarity
+    # Sort by activity; cap at 25 politicians per call to avoid truncated JSON
     summaries.sort(key=lambda x: -x["total_trades"])
+    summaries = summaries[:25]
 
     with _lock:
         prior = {k: v.get("score", 0) for k, v in state["politician_scores"].items()}
@@ -711,7 +946,8 @@ Recent activity to score (last 90 days):
 Prior scores for context:
 {json.dumps(prior, indent=2)}
 
-Respond ONLY with a JSON object (no markdown, no explanation outside the JSON):
+IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no explanation, no text before or after. Start your response with {{ and end with }}.
+
 {{
   "scores": {{
     "First Last": {{
@@ -725,17 +961,28 @@ Respond ONLY with a JSON object (no markdown, no explanation outside the JSON):
     try:
         response = _ai.messages.create(
             model="claude-opus-4-6",
-            max_tokens=2048,
+            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
         raw_text = response.content[0].text.strip()
 
-        # Extract JSON block
+        # Strip markdown fences if present (```json ... ``` or ``` ... ```)
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+        raw_text = raw_text.strip()
+
+        # Extract the outermost JSON object
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if not match:
-            log.error("Claude scoring: no JSON found in response")
+            log.error(f"Claude scoring: no JSON found in response. First 500 chars: {raw_text[:500]!r}")
             return
-        result     = json.loads(match.group())
+
+        try:
+            result = json.loads(match.group())
+        except json.JSONDecodeError as e:
+            log.error(f"Claude scoring JSON parse error: {e}. First 500 chars: {raw_text[:500]!r}")
+            return
+
         scores_out = result.get("scores", {})
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -762,8 +1009,6 @@ Respond ONLY with a JSON object (no markdown, no explanation outside the JSON):
             f"Send /scores for full list"
         )
 
-    except json.JSONDecodeError as e:
-        log.error(f"Claude scoring JSON parse error: {e}")
     except Exception as e:
         log.error(f"Claude scoring failed: {e}")
 
@@ -1074,8 +1319,45 @@ def main():
     if stale:
         score_politicians()
 
-    # Scheduling timestamps
-    last_disclosure  = 0.0
+    # ── Startup seed: mark all current disclosures as seen (no trades placed) ──
+    log.info("Seeding seen_trade_ids from current disclosures to prevent backfill trading...")
+    _probe_trades = fetch_recent_disclosures(pages=2)
+    if _probe_trades:
+        _src = _probe_trades[0].get("_source", "capitoltrades")
+        _src_label = {
+            "hsw":    "House Stock Watcher (housestockwatcher.com)",
+            "ssw":    "Senate Stock Watcher (senatestockwatcher.com)",
+            "quiver": "Quiver Quantitative (quiverquant.com)",
+        }.get(_src, "Capitol Trades BFF (bff.capitoltrades.com)")
+        _src_counts = {}
+        for t in _probe_trades:
+            s = t.get("_source", "capitoltrades")
+            _src_counts[s] = _src_counts.get(s, 0) + 1
+        if len(_src_counts) > 1:
+            _src_short = {"hsw": "House", "ssw": "Senate", "quiver": "Quiver"}
+            _detail = ", ".join(f"{_src_short.get(s, s)}: {n}" for s, n in _src_counts.items())
+            log.info(f"Data source: {len(_probe_trades)} records ({_detail})")
+        else:
+            log.info(f"Data source: {_src_label} returned {len(_probe_trades)} records")
+
+        with _lock:
+            existing_seen = set(state["seen_trade_ids"])
+            seeded_ids = []
+            for raw in _probe_trades:
+                trade = _parse_disclosure(raw)
+                if trade and trade["id"] not in existing_seen:
+                    existing_seen.add(trade["id"])
+                    seeded_ids.append(trade["id"])
+            if seeded_ids:
+                state["seen_trade_ids"].extend(seeded_ids)
+                state["seen_trade_ids"] = state["seen_trade_ids"][-2000:]
+                save_state()
+            log.info(f"Startup seed complete — {len(seeded_ids)} new IDs marked seen, {len(existing_seen)} total (no trades placed)")
+    else:
+        log.warning("Startup seed returned 0 records — all sources may be unavailable")
+
+    # Scheduling timestamps (last_disclosure pre-set so probe counts as first poll)
+    last_disclosure  = time.time()
     last_pos_check   = 0.0
     last_scoring     = time.time() if not stale else 0.0
     last_daily       = None
