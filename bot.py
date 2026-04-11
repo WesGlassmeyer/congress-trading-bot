@@ -5,6 +5,7 @@ Paper-trades by mirroring US Congress member stock disclosures.
 Dashboard: http://0.0.0.0:8081 | Telegram alerts | Claude-powered politician scoring
 """
 
+import io
 import os
 import json
 import re
@@ -12,10 +13,13 @@ import time
 import socket
 import logging
 import threading
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
 import dns.resolver
 import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import Flask, render_template_string
@@ -26,7 +30,7 @@ load_dotenv()
 #  DNS PATCH — route specific hostnames through Google DNS (8.8.8.8)
 #  The DigitalOcean droplet's default resolver fails to resolve these domains.
 # ══════════════════════════════════════════════════════════════════════════════
-_GOOGLE_DNS_HOSTS = {"housestockwatcher.com", "senatestockwatcher.com"}
+_GOOGLE_DNS_HOSTS = {"housestockwatcher.com", "senatestockwatcher.com", "www.ethics.senate.gov"}
 _google_resolver  = dns.resolver.Resolver(configure=False)
 _google_resolver.nameservers = ["8.8.8.8", "8.8.4.4"]
 _orig_getaddrinfo = socket.getaddrinfo
@@ -323,17 +327,33 @@ def close_alpaca_position(ticker: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DISCLOSURE SOURCES
-#  1. House Stock Watcher   https://housestockwatcher.com/api   (House, free)
-#     Senate Stock Watcher  https://senatestockwatcher.com/api  (Senate, free)
-#     ↳ both attempted; results merged to cover both chambers
-#  2. Capitol Trades BFF    https://bff.capitoltrades.com/trades (fallback)
+#  DISCLOSURE SOURCES  (tried in order; first group with data wins)
+#
+#  Group 1 — free JSON APIs (House + Senate)
+#    HSW   https://housestockwatcher.com/api
+#    SSW   https://senatestockwatcher.com/api
+#
+#  Group 2 — official government sources
+#    House Clerk  https://disclosures-clerk.house.gov  (PTR XML index + PDFs)
+#
+#  Group 3 — Capitol Trades (fallbacks)
+#    HTML scrape  https://www.capitoltrades.com/trades   (SPA — data via BFF)
+#    BFF JSON     https://bff.capitoltrades.com/trades   (503 as of 2026-04-10)
 # ══════════════════════════════════════════════════════════════════════════════
 _HSW_API    = "https://housestockwatcher.com/api"
 _SSW_API    = "https://senatestockwatcher.com/api"
 
-_CT_BFF_API = "https://bff.capitoltrades.com/trades"
-_CT_BFF_HDR = {
+_HOUSE_CLERK_BASE = "https://disclosures-clerk.house.gov"
+_HOUSE_CLERK_HDR  = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":     "text/html,application/xhtml+xml,application/xml,*/*",
+    "Referer":    "https://disclosures-clerk.house.gov/FinancialDisclosure",
+}
+_HOUSE_PTR_PDF_MAX = 30   # max PDFs to download per poll
+
+_CT_HTML_URL = "https://www.capitoltrades.com/trades"
+_CT_BFF_API  = "https://bff.capitoltrades.com/trades"
+_CT_BFF_HDR  = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept":     "application/json",
     "Origin":     "https://www.capitoltrades.com",
@@ -477,13 +497,199 @@ def _normalise_ssw(txn: dict, senator_name: str, filed_date: str) -> dict:
     }
 
 
-def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
-    """Fetch recent disclosures. Sources tried in order.
+def _parse_house_ptr_pdf(pdf_bytes: bytes, member_name: str, filed_date: str) -> list[dict]:
+    """Extract individual stock transactions from a House PTR PDF.
 
-    1. House Stock Watcher + Senate Stock Watcher (primary, free, no key needed)
-    2. Capitol Trades BFF (fallback)
+    House PTR PDFs are text-based (not scanned). pypdf extracts the text; we
+    regex-parse the repeating pattern:
+        (TICKER)
+        [asset_type]
+        [SP] P|S  MM/DD/YYYYmm/dd/yyyy  $lo - $hi
     """
-    # ── 1. House Stock Watcher + Senate Stock Watcher (merged) ──────────────
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text   = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    # Two consecutive MM/DD/YYYY dates appear butted against each other because
+    # the "Notification Date" column immediately follows "Date" in the PDF layout.
+    tx_re = re.compile(
+        r"\(([A-Z]{1,5})\)"                         # (TICKER)
+        r"[^\n]*\n"                                  # rest of asset name line
+        r"\[[A-Z]+\]\s*\n"                           # [ST] asset type line
+        r"(?:SP\s+)?"                                # optional "SP " (spouse row)
+        r"([PS])\s+"                                 # P=purchase  S=sale
+        r"(\d{2}/\d{2}/\d{4})"                      # transaction date
+        r"(\d{2}/\d{2}/\d{4})"                      # notification date (butted)
+        r"\s*(\$[\d,]+\s*-\s*\$[\d,]+)",            # amount range
+    )
+
+    trades = []
+    seen   = set()
+    for m in tx_re.finditer(text):
+        ticker      = m.group(1).upper()
+        tx_type     = "buy" if m.group(2) == "P" else "sell"
+        tx_date_raw = m.group(3)   # MM/DD/YYYY
+        amount_str  = m.group(5)
+
+        try:
+            tx_date = datetime.strptime(tx_date_raw, "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            tx_date = tx_date_raw
+
+        nums     = re.findall(r"[\d,]+", amount_str.replace("$", ""))
+        tx_value = sum(int(n.replace(",", "")) for n in nums) / max(len(nums), 1) if nums else 0.0
+
+        trade_id = f"house_{member_name}_{ticker}_{tx_date}"
+        if trade_id in seen:          # dedup SP (spouse) duplicate rows
+            continue
+        seen.add(trade_id)
+
+        trades.append({
+            "id":         trade_id,
+            "politician": member_name,
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "tx_type":    tx_type,
+            "tx_value":   tx_value,
+            "filed_date": filed_date,
+            "tx_date":    tx_date,
+            "_source":    "house_clerk",
+        })
+    return trades
+
+
+def _fetch_from_house_clerk() -> list[dict]:
+    """Fetch House Periodic Transaction Reports from the official House Clerk site.
+
+    Steps:
+      1. Download the year's PTR index XML  (financial-pdfs/{year}FD.xml)
+      2. Filter to filings within DISCLOSURE_LOOKBACK_DAYS
+      3. Download each PTR PDF and parse with _parse_house_ptr_pdf()
+
+    Returns normalised trades or raises on index download failure.
+    """
+    year      = datetime.now(timezone.utc).year
+    index_url = f"{_HOUSE_CLERK_BASE}/public_disc/financial-pdfs/{year}FD.xml"
+    r         = requests.get(index_url, headers=_HOUSE_CLERK_HDR, timeout=30)
+    r.raise_for_status()
+
+    root   = ET.fromstring(r.content.decode("utf-8-sig"))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DISCLOSURE_LOOKBACK_DAYS)
+
+    # Collect PTR entries filed within the lookback window
+    recent_ptrs = []
+    for member in root.findall("Member"):
+        if member.findtext("FilingType") != "P":
+            continue
+        date_str = member.findtext("FilingDate") or ""
+        try:
+            filed_dt = datetime.strptime(date_str, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if filed_dt < cutoff:
+            continue
+        first  = (member.findtext("First") or "").strip()
+        last   = (member.findtext("Last")  or "").strip()
+        name   = f"{first} {last}".strip()
+        doc_id = member.findtext("DocID") or ""
+        recent_ptrs.append((name, doc_id, filed_dt.strftime("%Y-%m-%d")))
+
+    if not recent_ptrs:
+        log.info("House Clerk PTR: no filings within lookback window")
+        return []
+
+    # Cap to avoid downloading too many PDFs in one poll
+    recent_ptrs = recent_ptrs[:_HOUSE_PTR_PDF_MAX]
+    log.info(f"House Clerk PTR: {len(recent_ptrs)} PTR(s) within lookback window — downloading PDFs")
+
+    trades = []
+    for name, doc_id, filed_iso in recent_ptrs:
+        pdf_url = f"{_HOUSE_CLERK_BASE}/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+        try:
+            pdf_r = requests.get(pdf_url, headers=_HOUSE_CLERK_HDR, timeout=20)
+            pdf_r.raise_for_status()
+            parsed = _parse_house_ptr_pdf(pdf_r.content, name, filed_iso)
+            log.debug(f"  {name} (DocID={doc_id}): {len(parsed)} trade(s)")
+            trades.extend(parsed)
+        except Exception as e:
+            log.debug(f"  House PTR {doc_id} ({name}) failed: {e}")
+
+    log.info(f"House Clerk PTR: {len(trades)} trade(s) extracted from {len(recent_ptrs)} PTR(s)")
+    return trades
+
+
+def _fetch_from_capitoltrades_html() -> list[dict]:
+    """Attempt to scrape trade data from the Capitol Trades HTML page.
+
+    NOTE: capitoltrades.com is a Next.js SPA — trade data is fetched
+    client-side from bff.capitoltrades.com. When the BFF is down, the static
+    HTML contains only page shell (no trade rows). This function will raise
+    RuntimeError in that case and the caller falls through to the next source.
+    """
+    hdrs = {**_CT_BFF_HDR, "Accept": "text/html,application/xhtml+xml"}
+    r    = requests.get(_CT_HTML_URL, headers=hdrs, timeout=30)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # Next.js app-router pages don't embed __NEXT_DATA__; look for a trades table.
+    table = soup.find("table")
+    if not table:
+        raise RuntimeError(
+            "Capitol Trades HTML: no <table> found — page is a client-side SPA "
+            "and BFF (bff.capitoltrades.com) appears to be down"
+        )
+
+    trades = []
+    rows   = table.find_all("tr")[1:]   # skip header row
+    for row in rows:
+        cells = [c.get_text(strip=True) for c in row.find_all("td")]
+        if len(cells) < 6:
+            continue
+        # Expected columns when table is present:
+        # politician | ticker | asset | tx_type | date | amount
+        politician = cells[0]
+        ticker     = cells[1].upper().strip()
+        tx_type    = cells[3].lower()
+        tx_type    = "buy" if "purchase" in tx_type or "buy" in tx_type else ("sell" if "sale" in tx_type else tx_type)
+        date_str   = cells[4]
+        amount_str = cells[5]
+
+        nums     = re.findall(r"[\d,]+", amount_str.replace("$", ""))
+        tx_value = sum(int(n.replace(",", "")) for n in nums) / max(len(nums), 1) if nums else 0.0
+
+        try:
+            filed_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            filed_date = date_str
+
+        if not ticker or not politician:
+            continue
+        trades.append({
+            "id":         f"ct_html_{politician}_{ticker}_{filed_date}",
+            "politician": politician,
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "tx_type":    tx_type,
+            "tx_value":   tx_value,
+            "filed_date": filed_date,
+            "tx_date":    filed_date,
+            "_source":    "ct_html",
+        })
+
+    if not trades:
+        raise RuntimeError("Capitol Trades HTML: table found but no parseable rows")
+    return trades
+
+
+def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
+    """Fetch recent disclosures. Sources tried in order; first group with data wins.
+
+    1. House Stock Watcher + Senate Stock Watcher (primary, free JSON APIs)
+    2. House Clerk PTR (official government source — XML index + PDF parsing)
+    3. Capitol Trades HTML scrape (SPA; only works if BFF renders data server-side)
+    4. Capitol Trades BFF JSON (last resort; 503 since ~2026-04-10)
+    """
+    # ── 1. House Stock Watcher + Senate Stock Watcher (free JSON APIs) ──────
     merged = []
     for label, fn in (("House Stock Watcher", _fetch_from_hsw),
                       ("Senate Stock Watcher", _fetch_from_ssw)):
@@ -493,11 +699,26 @@ def fetch_recent_disclosures(pages: int = 2) -> list[dict]:
             merged.extend(batch)
         except Exception as e:
             log.warning(f"{label} unavailable: {e}")
-
     if merged:
         return merged
 
-    # ── 2. Capitol Trades BFF (House + Senate, fallback) ─────────────────────
+    # ── 2. House Clerk PTR  (official gov source — XML index + PDF parsing) ─
+    try:
+        trades = _fetch_from_house_clerk()
+        if trades:
+            return trades
+    except Exception as e:
+        log.warning(f"House Clerk PTR unavailable: {e}")
+
+    # ── 3. Capitol Trades HTML (SPA — only works if BFF serves SSR data) ────
+    try:
+        trades = _fetch_from_capitoltrades_html()
+        log.info(f"Capitol Trades HTML: {len(trades)} trade(s) scraped")
+        return trades
+    except Exception as e:
+        log.warning(f"Capitol Trades HTML: {e}")
+
+    # ── 4. Capitol Trades BFF JSON (last resort) ──────────────────────────────
     try:
         trades = _fetch_from_capitoltrades(pages)
         log.info(f"Capitol Trades BFF: fetched {len(trades)} raw disclosures")
@@ -511,8 +732,8 @@ def _parse_disclosure(raw: dict) -> dict | None:
     """Normalise a raw disclosure item into our internal format.
     HSW/SSW records are already normalised; pass them through.
     """
-    # Already normalised (came from HSW or SSW)
-    if raw.get("_source") in ("hsw", "ssw"):
+    # Already normalised (HSW, SSW, House Clerk PTR, Capitol Trades HTML)
+    if raw.get("_source") in ("hsw", "ssw", "house_clerk", "ct_html"):
         return raw if (raw.get("politician") and raw.get("ticker")) else None
 
     # Capitol Trades BFF shape
@@ -1286,15 +1507,17 @@ def main():
     if _probe_trades:
         _src = _probe_trades[0].get("_source", "capitoltrades")
         _src_label = {
-            "hsw": "House Stock Watcher (housestockwatcher.com)",
-            "ssw": "Senate Stock Watcher (senatestockwatcher.com)",
+            "hsw":         "House Stock Watcher (housestockwatcher.com)",
+            "ssw":         "Senate Stock Watcher (senatestockwatcher.com)",
+            "house_clerk": "House Clerk PTR (disclosures-clerk.house.gov)",
+            "ct_html":     "Capitol Trades HTML (capitoltrades.com)",
         }.get(_src, "Capitol Trades BFF (bff.capitoltrades.com)")
         _src_counts = {}
         for t in _probe_trades:
             s = t.get("_source", "capitoltrades")
             _src_counts[s] = _src_counts.get(s, 0) + 1
         if len(_src_counts) > 1:
-            _src_short = {"hsw": "House", "ssw": "Senate"}
+            _src_short = {"hsw": "House", "ssw": "Senate", "house_clerk": "HouseClerk", "ct_html": "CT-HTML"}
             _detail = ", ".join(f"{_src_short.get(s, s)}: {n}" for s, n in _src_counts.items())
             log.info(f"Data source: {len(_probe_trades)} records ({_detail})")
         else:
