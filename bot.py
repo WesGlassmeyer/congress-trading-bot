@@ -1066,6 +1066,19 @@ def _close_position(ticker: str, pos: dict, exit_price: float, reason: str):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLAUDE POLITICIAN SCORING
+
+def _tickers_from_seen_ids(seen_ids: list[str]) -> dict[str, list[str]]:
+    """Parse politician → sorted ticker list from quiver seed IDs.
+
+    ID format: quiver_{politician name}_{TICKER}_{date}
+    Returns a dict mapping politician name → sorted unique ticker list.
+    """
+    pol_tickers: dict[str, set[str]] = {}
+    for tid in seen_ids:
+        m = re.match(r"quiver_(.+?)_([A-Z]{1,5})_", tid)
+        if m:
+            pol_tickers.setdefault(m.group(1), set()).add(m.group(2))
+    return {pol: sorted(tickers) for pol, tickers in pol_tickers.items()}
 # ══════════════════════════════════════════════════════════════════════════════
 def score_politicians():
     """Use Claude to score active politicians based on their recent trade history.
@@ -1076,9 +1089,10 @@ def score_politicians():
     """
     log.info("Refreshing politician scores via Claude...")
 
-    # ── Load existing scores — these form the full scoring pool ─────────────
+    # ── Load existing scores and build ticker history from seed data ─────────
     with _lock:
         existing_scores = dict(state.get("politician_scores", {}))
+        seed_tickers    = _tickers_from_seen_ids(state.get("seen_trade_ids", []))
 
     # ── Build fresh-data summaries from any available disclosures ────────────
     fresh_summaries: dict[str, dict] = {}   # keyed by politician name
@@ -1136,7 +1150,7 @@ def score_politicians():
                     "total_trades": trade_count,
                     "buys":         trade_count,
                     "sells":        0,
-                    "tickers":      [],
+                    "tickers":      seed_tickers.get(pol, [])[:15],
                     "avg_value":    0,
                     "data_note":    "no recent filings — scored from historical trade count",
                 }
@@ -1160,10 +1174,13 @@ def score_politicians():
     summaries.sort(key=lambda x: -x["total_trades"])
     summaries = summaries[:25]
 
-    # Embed each politician's prior score directly in their summary entry so
-    # Claude sees it alongside the trade data, not in a separate block.
+    # Embed prior score AND an explicit floor in each entry so Claude has a
+    # concrete lower bound to reason against, not just a soft anchor.
     for s in summaries:
-        s["prior_score"] = existing_scores.get(s["name"], {}).get("score", None)
+        prior = existing_scores.get(s["name"], {}).get("score", None)
+        s["prior_score"] = prior
+        if prior is not None:
+            s["score_floor"] = max(0, prior - 15)
 
     # Use a lower threshold during recess when fresh PTR data is sparse.
     active_threshold = RECESS_THRESHOLD if fresh_ct < 5 else MIN_POLITICIAN_SCORE
@@ -1185,9 +1202,14 @@ Key scoring factors:
 4. Known high-signal politicians: Nancy Pelosi, Brian Mast, Michael McCaul, Dan Crenshaw, Tommy Tuberville
 5. Ratio of buys to sells (active buyers > pure sellers)
 
-Each entry includes a prior_score field — use it as an anchor. Scores should not shift more than ~15 points without new data supporting the change.
+CRITICAL SCORING RULE — prior score anchoring:
+Each entry has a prior_score (last known score) and a score_floor (prior_score minus 15).
+- You MUST NOT score any politician below their score_floor unless you have specific new negative evidence in the data above.
+- Absence of new filings is NOT negative evidence — Congress is frequently in recess.
+- If a politician had prior_score=80 and score_floor=65, their new score must be ≥ 65 unless something in their data clearly justifies a larger drop.
+- The tickers list shows their known trading history — use it to assess sector expertise even when no new filings are present.
 
-Politicians to score (last 90 days of activity; prior_score = last known score):
+Politicians to score (last 90 days; prior_score = last known score, score_floor = minimum allowed score):
 {json.dumps(summaries, indent=2)}
 
 IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no explanation, no text before or after. Start your response with {{ and end with }}.
@@ -1539,6 +1561,18 @@ def health():
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def _start_dashboard():
+    # Kill any stale process already bound to the dashboard port so Flask
+    # doesn't fail silently on restart.
+    try:
+        import subprocess
+        subprocess.run(
+            ["fuser", "-k", f"{DASHBOARD_PORT}/tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.5)  # brief pause for the OS to release the port
+    except Exception:
+        pass
     app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False, use_reloader=False)
 
 
