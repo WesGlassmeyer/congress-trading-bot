@@ -1072,12 +1072,16 @@ def score_politicians():
     """
     log.info("Refreshing politician scores via Claude...")
 
-    # ── Try to build summaries from fresh disclosures ────────────────────────
-    summaries: list[dict] = []
+    # ── Load existing scores — these form the full scoring pool ─────────────
+    with _lock:
+        existing_scores = dict(state.get("politician_scores", {}))
+
+    # ── Build fresh-data summaries from any available disclosures ────────────
+    fresh_summaries: dict[str, dict] = {}   # keyed by politician name
     try:
         raw_trades = fetch_recent_disclosures(pages=5)
     except Exception as e:
-        log.warning(f"Disclosure fetch for scoring failed: {e} — will fall back to existing data")
+        log.warning(f"Disclosure fetch for scoring failed: {e} — scoring from existing data only")
         raw_trades = []
 
     if raw_trades:
@@ -1103,44 +1107,50 @@ def score_politicians():
             sells   = [t for t in trades if t["tx_type"] == "sell"]
             tickers = sorted({t["ticker"] for t in trades})
             avg_val = sum(t["tx_value"] for t in trades if t["tx_value"] > 0) / max(len(trades), 1)
-            summaries.append({
+            fresh_summaries[pol] = {
                 "name":         pol,
                 "total_trades": len(trades),
                 "buys":         len(buys),
                 "sells":        len(sells),
                 "tickers":      tickers[:15],
                 "avg_value":    round(avg_val),
-            })
+            }
 
-    # ── Fallback: re-score from existing state data when no disclosures ───────
-    if not summaries:
-        with _lock:
-            existing_scores = dict(state.get("politician_scores", {}))
+    # ── Merge: fresh data takes precedence; fill gaps from existing scores ────
+    # Always score the full known politician pool so Claude produces a complete
+    # ranked list regardless of how many new PTRs were filed.
+    summaries_map: dict[str, dict] = {}
 
-        if not existing_scores:
-            log.warning("No fresh disclosures and no existing scores — skipping scoring")
-            return
-
-        log.info(
-            f"No new disclosures available (Congress recess?); "
-            f"re-scoring {len(existing_scores)} politicians from last-known data"
-        )
-        for pol, info in existing_scores.items():
+    for pol, info in existing_scores.items():
+        if pol in fresh_summaries:
+            summaries_map[pol] = fresh_summaries[pol]
+        else:
             trade_count = info.get("trade_count_90d", 0)
             if trade_count > 0:
-                summaries.append({
+                summaries_map[pol] = {
                     "name":         pol,
                     "total_trades": trade_count,
-                    "buys":         trade_count,  # buy/sell split not stored separately
+                    "buys":         trade_count,
                     "sells":        0,
                     "tickers":      [],
                     "avg_value":    0,
-                    "data_note":    "re-scored from historical trade count; no new filings",
-                })
+                    "data_note":    "no recent filings — scored from historical trade count",
+                }
 
-        if not summaries:
-            log.warning("Existing score data has no trade counts — skipping scoring")
-            return
+    # Also include any politicians who appeared in fresh PTRs but aren't yet in state
+    for pol, summary in fresh_summaries.items():
+        if pol not in summaries_map:
+            summaries_map[pol] = summary
+
+    summaries = list(summaries_map.values())
+
+    if not summaries:
+        log.warning("No politician data available for scoring — skipping")
+        return
+
+    fresh_ct = len(fresh_summaries)
+    hist_ct  = len(summaries) - fresh_ct
+    log.info(f"Scoring pool: {len(summaries)} politicians ({fresh_ct} with fresh PTRs, {hist_ct} from historical data)")
 
     # Sort by activity; cap at 25 politicians per call to avoid truncated JSON
     summaries.sort(key=lambda x: -x["total_trades"])
