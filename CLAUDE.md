@@ -41,7 +41,7 @@ ANTHROPIC_API_KEY=
 - `bot.py` calls `_run_scorer()` which launches the subprocess then reloads scores from `state.json`
 - Minimum score to follow a trade: **60** (configured as `MIN_POLITICIAN_SCORE`)
 - Recess mode threshold: **50** when fewer than 5 fresh PTRs are available
-- Currently **8 politicians above threshold** (out of ~28 scored)
+- Currently **8 politicians above threshold** (out of 28 scored)
 - Capped at 20 politicians per scoring call
 - Prior scores logged before each API call to verify correct values reach the prompt
 - **Python-side floor clamp**: after Claude responds, `final_score = max(returned_score, prior - 15)` — enforced unconditionally; logs a warning when it fires
@@ -82,4 +82,3 @@ ANTHROPIC_API_KEY=
 - Capitol Trades BFF returning 503 on all endpoints since 2026-04-10
 - `efts.senate.gov` domain does not exist (NXDOMAIN); Senate trades unavailable until HSW/SSW recover
 - Senate stock data gap: only House PTRs available via House Clerk source
-- OOM kill (exit 137) during Claude API call was fixed by moving scoring to `score.py` subprocess
