@@ -1064,49 +1064,83 @@ def _close_position(ticker: str, pos: dict, exit_price: float, reason: str):
 #  CLAUDE POLITICIAN SCORING
 # ══════════════════════════════════════════════════════════════════════════════
 def score_politicians():
-    """Use Claude to score active politicians based on their recent trade history."""
+    """Use Claude to score active politicians based on their recent trade history.
+
+    Scoring runs on its own 24h schedule independent of disclosure availability.
+    If no fresh disclosures are returned (e.g., Congress recess), scoring falls
+    back to the last-known trade counts stored in state rather than skipping.
+    """
     log.info("Refreshing politician scores via Claude...")
+
+    # ── Try to build summaries from fresh disclosures ────────────────────────
+    summaries: list[dict] = []
     try:
         raw_trades = fetch_recent_disclosures(pages=5)
     except Exception as e:
-        log.error(f"Failed to fetch trades for scoring: {e}")
-        return
+        log.warning(f"Disclosure fetch for scoring failed: {e} — will fall back to existing data")
+        raw_trades = []
 
-    # Aggregate trades per politician (last 90 days)
-    cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=90)
-    pol_map: dict[str, list[dict]] = {}
-    for raw in raw_trades:
-        trade = _parse_disclosure(raw)
-        if not trade:
-            continue
-        # Recency filter
-        if trade["filed_date"]:
-            try:
-                filed = datetime.fromisoformat(trade["filed_date"].replace("Z", "+00:00"))
-                if filed < cutoff:
-                    continue
-            except Exception:
-                pass
-        pol_map.setdefault(trade["politician"], []).append(trade)
+    if raw_trades:
+        cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=90)
+        pol_map: dict[str, list[dict]] = {}
+        for raw in raw_trades:
+            trade = _parse_disclosure(raw)
+            if not trade:
+                continue
+            if trade["filed_date"]:
+                try:
+                    filed = datetime.fromisoformat(trade["filed_date"].replace("Z", "+00:00"))
+                    if filed.tzinfo is None:
+                        filed = filed.replace(tzinfo=timezone.utc)
+                    if filed < cutoff:
+                        continue
+                except Exception:
+                    pass
+            pol_map.setdefault(trade["politician"], []).append(trade)
 
-    if not pol_map:
-        log.warning("No recent politician trades to score")
-        return
+        for pol, trades in pol_map.items():
+            buys    = [t for t in trades if t["tx_type"] in ("buy", "purchase")]
+            sells   = [t for t in trades if t["tx_type"] == "sell"]
+            tickers = sorted({t["ticker"] for t in trades})
+            avg_val = sum(t["tx_value"] for t in trades if t["tx_value"] > 0) / max(len(trades), 1)
+            summaries.append({
+                "name":         pol,
+                "total_trades": len(trades),
+                "buys":         len(buys),
+                "sells":        len(sells),
+                "tickers":      tickers[:15],
+                "avg_value":    round(avg_val),
+            })
 
-    summaries = []
-    for pol, trades in pol_map.items():
-        buys    = [t for t in trades if t["tx_type"] in ("buy", "purchase")]
-        sells   = [t for t in trades if t["tx_type"] == "sell"]
-        tickers = sorted({t["ticker"] for t in trades})
-        avg_val = sum(t["tx_value"] for t in trades if t["tx_value"] > 0) / max(len(trades), 1)
-        summaries.append({
-            "name":         pol,
-            "total_trades": len(trades),
-            "buys":         len(buys),
-            "sells":        len(sells),
-            "tickers":      tickers[:15],
-            "avg_value":    round(avg_val),
-        })
+    # ── Fallback: re-score from existing state data when no disclosures ───────
+    if not summaries:
+        with _lock:
+            existing_scores = dict(state.get("politician_scores", {}))
+
+        if not existing_scores:
+            log.warning("No fresh disclosures and no existing scores — skipping scoring")
+            return
+
+        log.info(
+            f"No new disclosures available (Congress recess?); "
+            f"re-scoring {len(existing_scores)} politicians from last-known data"
+        )
+        for pol, info in existing_scores.items():
+            trade_count = info.get("trade_count_90d", 0)
+            if trade_count > 0:
+                summaries.append({
+                    "name":         pol,
+                    "total_trades": trade_count,
+                    "buys":         trade_count,  # buy/sell split not stored separately
+                    "sells":        0,
+                    "tickers":      [],
+                    "avg_value":    0,
+                    "data_note":    "re-scored from historical trade count; no new filings",
+                })
+
+        if not summaries:
+            log.warning("Existing score data has no trade counts — skipping scoring")
+            return
 
     # Sort by activity; cap at 25 politicians per call to avoid truncated JSON
     summaries.sort(key=lambda x: -x["total_trades"])
