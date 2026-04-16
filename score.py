@@ -556,6 +556,13 @@ def score_politicians():
     if active_threshold != MIN_POLITICIAN_SCORE:
         log.info(f"Recess mode: using threshold {active_threshold} (only {fresh_ct} fresh PTRs)")
 
+    # Log prior scores so we can verify correct values are reaching the prompt
+    prior_log = ", ".join(
+        f"{s['name']}: prior={s.get('prior_score')}/floor={s.get('score_floor', 'n/a')}"
+        for s in summaries
+    )
+    log.info(f"Prior scores being sent to Claude: {prior_log}")
+
     prompt = f"""You are evaluating US Congress member stock disclosures to score their predictive value for copy-trading.
 
 Score each politician 0-100 where:
@@ -571,14 +578,15 @@ Key scoring factors:
 4. Known high-signal politicians: Nancy Pelosi, Brian Mast, Michael McCaul, Dan Crenshaw, Tommy Tuberville
 5. Ratio of buys to sells (active buyers > pure sellers)
 
-CRITICAL SCORING RULE — prior score anchoring:
-Each entry has a prior_score (last known score) and a score_floor (prior_score minus 15).
-- You MUST NOT score any politician below their score_floor unless you have specific new negative evidence in the data above.
+MANDATORY SCORING RULE — you must follow this exactly:
+- You MUST start from each politician's prior_score. That is the baseline.
+- The score_floor is an absolute minimum — you cannot go below it under any circumstances.
+- If you have no new negative evidence, return exactly the prior_score. Do not adjust it downward.
+- Only adjust the score if you have specific new data in the entry (e.g. new trades, new tickers, a change in activity).
 - Absence of new filings is NOT negative evidence — Congress is frequently in recess.
-- If a politician had prior_score=80 and score_floor=65, their new score must be ≥ 65 unless something in their data clearly justifies a larger drop.
-- The tickers list shows their known trading history — use it to assess sector expertise even when no new filings are present.
+- prior_score=null means this is a new politician; score them from scratch using the trading data provided.
 
-Politicians to score (last 90 days; prior_score = last known score, score_floor = minimum allowed score):
+Politicians to score (last 90 days; prior_score = last known score, score_floor = absolute minimum allowed):
 {json.dumps(summaries, indent=2)}
 
 IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no explanation, no text before or after. Start your response with {{ and end with }}.
