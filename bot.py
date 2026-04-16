@@ -810,13 +810,21 @@ def poll_disclosures():
         dstart     = state["daily_start_balance"]
         paused     = state["paused"]
         seen_set   = set(state["seen_trade_ids"])
+        # Include current mark-to-market value of open positions so deployed
+        # capital isn't counted as a loss — only realized + unrealized PnL matters.
+        open_pos_value = sum(
+            pos.get("cost", 0) + pos.get("pnl", 0.0)
+            for pos in state["positions"].values()
+        )
 
-    # Enforce daily loss limit
-    if not paused and bal > 0 and (bal / dstart - 1) <= -DAILY_LOSS_LIMIT_PCT:
-        log.warning(f"Daily loss limit hit (${bal:.2f} vs ${dstart:.2f}). Pausing.")
+    # Enforce daily loss limit on effective balance (cash + open position value).
+    # This prevents capital deployed into open positions from falsely triggering.
+    effective_balance = bal + open_pos_value
+    if not paused and effective_balance > 0 and (effective_balance / dstart - 1) <= -DAILY_LOSS_LIMIT_PCT:
+        log.warning(f"Daily loss limit hit (effective ${effective_balance:.2f} vs start ${dstart:.2f}). Pausing.")
         tg_send(
             f"⚠️ <b>Daily loss limit hit</b>\n"
-            f"Balance ${bal:.2f} vs start ${dstart:.2f}\n"
+            f"Effective balance ${effective_balance:.2f} vs start ${dstart:.2f}\n"
             f"Bot paused. Send /start to resume."
         )
         with _lock:
@@ -1542,7 +1550,17 @@ def main():
     # Scheduling timestamps (last_disclosure pre-set so probe counts as first poll)
     last_disclosure  = time.time()
     last_pos_check   = 0.0
-    last_scoring     = time.time() if not stale else 0.0
+    # Anchor last_scoring to the actual last refresh time (persisted in state) so
+    # the 24h interval survives restarts and doesn't double-trigger at startup.
+    with _lock:
+        _last_refresh_str = state.get("last_score_refresh")
+    if _last_refresh_str:
+        try:
+            last_scoring = datetime.fromisoformat(_last_refresh_str).timestamp()
+        except Exception:
+            last_scoring = 0.0
+    else:
+        last_scoring = 0.0
     last_daily       = None
 
     log.info("Main loop running")
