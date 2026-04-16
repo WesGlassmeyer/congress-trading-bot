@@ -1,6 +1,6 @@
 # Congress Trading Bot — Project Notes
 
-> Last updated: 2026-04-16
+> Last updated: 2026-04-16 (session 2)
 
 ## What this is
 Python bot that monitors US Congress stock disclosures and mirrors qualifying trades on an Alpaca paper-trading account. Sends alerts via Telegram. Scores politicians using Claude before following their trades.
@@ -9,7 +9,8 @@ Python bot that monitors US Congress stock disclosures and mirrors qualifying tr
 - Runs on the same DigitalOcean droplet as other bots
 - Dashboard on port **8081** (`http://<droplet-ip>:8081`)
 - Entry point: `bot.py`
-- State persisted to `state.json`
+- State persisted to `state.json` (gitignored — live state only)
+- Scoring runs in a **separate subprocess** via `score.py` to isolate Claude API memory spike
 
 ## Data Sources (current status)
 Priority order in `fetch_recent_disclosures()`:
@@ -36,10 +37,21 @@ ANTHROPIC_API_KEY=
 
 ## Politician Scoring
 - Claude (`claude-opus-4-6`) scores politicians 0–100 every 24h
+- Scoring runs in `score.py` as a **subprocess** of `bot.py` — child exits after scoring, freeing memory
+- `bot.py` calls `_run_scorer()` which launches the subprocess then reloads scores from `state.json`
 - Minimum score to follow a trade: **60** (configured as `MIN_POLITICIAN_SCORE`)
-- Currently **8 politicians above threshold** (out of 28 scored)
-- Capped at 25 politicians per scoring call to prevent JSON truncation
+- Recess mode threshold: **50** when fewer than 5 fresh PTRs are available
+- Currently **8 politicians above threshold** (out of ~28 scored)
+- Capped at 20 politicians per scoring call
+- Prior scores logged before each API call to verify correct values reach the prompt
+- **Python-side floor clamp**: after Claude responds, `final_score = max(returned_score, prior - 15)` — enforced unconditionally; logs a warning when it fires
 - If scoring returns malformed JSON, first 500 chars of Claude's raw response are logged
+
+### Score anchoring history
+- 2026-04-16: Bad scoring run drove all scores to 20–35 (Claude ignored prompt anchoring)
+- Fix: stronger prompt mandate + Python clamp added; April 11 scores manually restored:
+  Mullin 80, Hickenlooper 78, Hern 76, Gottheimer 74, Tuberville 68,
+  Jackson 66, Cisneros 65, King 60, Moore 58, Boozman 56
 
 ## Trade Filters
 - Only stocks/ETFs (no options, crypto, etc.)
@@ -70,3 +82,4 @@ ANTHROPIC_API_KEY=
 - Capitol Trades BFF returning 503 on all endpoints since 2026-04-10
 - `efts.senate.gov` domain does not exist (NXDOMAIN); Senate trades unavailable until HSW/SSW recover
 - Senate stock data gap: only House PTRs available via House Clerk source
+- OOM kill (exit 137) during Claude API call was fixed by moving scoring to `score.py` subprocess
