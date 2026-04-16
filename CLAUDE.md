@@ -1,6 +1,6 @@
 # Congress Trading Bot — Project Notes
 
-> Last updated: 2026-04-11
+> Last updated: 2026-04-16
 
 ## What this is
 Python bot that monitors US Congress stock disclosures and mirrors qualifying trades on an Alpaca paper-trading account. Sends alerts via Telegram. Scores politicians using Claude before following their trades.
