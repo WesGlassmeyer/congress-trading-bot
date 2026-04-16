@@ -12,6 +12,7 @@ import re
 import time
 import socket
 import logging
+import subprocess
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -1088,12 +1089,54 @@ def _quiver_tickers_for(politician: str, seen_ids: list[str]) -> list[str]:
                     break
     return sorted(tickers)
 # ══════════════════════════════════════════════════════════════════════════════
-def score_politicians():
+def _run_scorer():
+    """Run score.py in a subprocess to isolate the Claude API memory spike.
+
+    The child process reads state.json, calls Claude, writes updated scores back,
+    then exits — freeing all that memory before control returns here. After it
+    completes we reload the relevant fields from disk into the live state dict.
+    """
+    log.info("Launching score.py subprocess for politician scoring...")
+    scorer_path = os.path.join(os.path.dirname(__file__), "score.py")
+    venv_python = os.path.join(os.path.dirname(__file__), "venv", "bin", "python")
+    try:
+        result = subprocess.run(
+            [venv_python, scorer_path],
+            timeout=120,
+            cwd=os.path.dirname(__file__),
+        )
+        if result.returncode != 0:
+            log.warning(f"score.py exited with code {result.returncode}")
+    except subprocess.TimeoutExpired:
+        log.error("score.py timed out after 120s")
+        return
+    except Exception as e:
+        log.error(f"score.py subprocess failed: {e}")
+        return
+
+    # Reload scoring results from disk into the live state dict
+    try:
+        with open(STATE_FILE) as f:
+            fresh = json.load(f)
+        with _lock:
+            state["politician_scores"]  = fresh.get("politician_scores", state["politician_scores"])
+            state["last_score_refresh"] = fresh.get("last_score_refresh", state["last_score_refresh"])
+            state["active_threshold"]   = fresh.get("active_threshold", state["active_threshold"])
+        log.info("Reloaded politician scores from disk after subprocess scoring")
+    except Exception as e:
+        log.error(f"Failed to reload scores from disk: {e}")
+
+
+def score_politicians():  # kept for reference; called via _run_scorer() subprocess
     """Use Claude to score active politicians based on their recent trade history.
 
     Scoring runs on its own 24h schedule independent of disclosure availability.
     If no fresh disclosures are returned (e.g., Congress recess), scoring falls
     back to the last-known trade counts stored in state rather than skipping.
+
+    NOTE: This function is no longer called directly. All scoring is dispatched
+    through _run_scorer() which executes score.py as a subprocess so the memory
+    spike from the Claude API response is isolated and freed on child exit.
     """
     log.info("Refreshing politician scores via Claude...")
 
@@ -1619,7 +1662,7 @@ def main():
         except Exception:
             pass
     if stale:
-        score_politicians()
+        _run_scorer()
 
     # ── Startup seed: mark all current disclosures as seen (no trades placed) ──
     log.info("Seeding seen_trade_ids from current disclosures to prevent backfill trading...")
@@ -1693,7 +1736,7 @@ def main():
 
         # Re-score politicians every 24h
         if now_ts - last_scoring >= SCORE_REFRESH_HOURS * 3600:
-            score_politicians()
+            _run_scorer()
             last_scoring = now_ts
 
         # Daily summary at midnight UTC (within first 2 min of hour 0)
