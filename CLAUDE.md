@@ -37,7 +37,7 @@ ANTHROPIC_API_KEY=
 ## Politician Scoring
 - Claude (`claude-opus-4-6`) scores politicians 0–100 every 24h
 - Minimum score to follow a trade: **60** (configured as `MIN_POLITICIAN_SCORE`)
-- Currently **8 politicians above threshold** (out of 25 scored)
+- Currently **8 politicians above threshold** (out of 28 scored)
 - Capped at 25 politicians per scoring call to prevent JSON truncation
 - If scoring returns malformed JSON, first 500 chars of Claude's raw response are logged
 
