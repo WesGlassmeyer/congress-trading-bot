@@ -1234,7 +1234,20 @@ IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no exp
         )
 
     except Exception as e:
-        log.error(f"Claude scoring failed: {e}")
+        status = getattr(e, "status_code", None)
+        if status in (400, 429):
+            # Usage/quota limit — don't retry until the next scheduled 24h refresh.
+            # Update last_score_refresh so restarts don't immediately retry either.
+            # Existing politician_scores in state remain active for trade decisions.
+            with _lock:
+                state["last_score_refresh"] = datetime.now(timezone.utc).isoformat()
+                save_state()
+            log.warning(
+                f"Claude API usage limit (HTTP {status}) — scoring skipped; "
+                f"existing scores remain active until next 24h refresh"
+            )
+        else:
+            log.error(f"Claude scoring failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
