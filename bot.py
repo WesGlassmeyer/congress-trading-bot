@@ -56,6 +56,7 @@ PAPER_TRADE_SIZE        = 100        # Fixed $ per paper trade
 PAPER_STARTING_BALANCE  = 1000       # Starting paper balance ($)
 DAILY_LOSS_LIMIT_PCT    = 0.10       # Pause if balance drops 10% in a day
 MIN_POLITICIAN_SCORE    = 60         # Min Claude score (0–100) to follow
+RECESS_THRESHOLD        = 50         # Lower threshold when < 5 fresh PTRs available
 SCORE_REFRESH_HOURS     = 24         # Hours between politician re-scores
 DISCLOSURE_POLL_MINUTES = 30         # Minutes between disclosure polls
 MIN_TRADE_VALUE         = 15_000     # Min disclosed $ value to act on
@@ -113,6 +114,7 @@ def _blank_state() -> dict:
         "seen_trade_ids":      [],   # dedup Capitol Trades IDs (capped at 2000)
         "paused":              False,
         "last_score_refresh":  None,
+        "active_threshold":    MIN_POLITICIAN_SCORE,
         "stats": {
             "total_trades": 0,
             "wins":         0,
@@ -222,7 +224,8 @@ def _tg_send_scores():
     lines = ["<b>Politician Scores</b>"]
     for name, info in sorted(scores.items(), key=lambda x: -x[1].get("score", 0)):
         score = info.get("score", 0)
-        flag  = "✅" if score >= MIN_POLITICIAN_SCORE else "❌"
+        threshold = state.get("active_threshold", MIN_POLITICIAN_SCORE)
+        flag  = "✅" if score >= threshold else "❌"
         lines.append(f"{flag} {name}: <b>{score}</b>/100")
     tg_send("\n".join(lines))
 
@@ -890,11 +893,12 @@ def _evaluate_trade(trade: dict, paused: bool):
 
     # Politician score gate
     with _lock:
-        score_info = state["politician_scores"].get(politician, {})
-        score      = score_info.get("score", 0)
+        score_info       = state["politician_scores"].get(politician, {})
+        score            = score_info.get("score", 0)
+        active_threshold = state.get("active_threshold", MIN_POLITICIAN_SCORE)
 
-    if score < MIN_POLITICIAN_SCORE:
-        log.info(f"Skip {politician}/{ticker}: score {score} < {MIN_POLITICIAN_SCORE}")
+    if score < active_threshold:
+        log.info(f"Skip {politician}/{ticker}: score {score} < {active_threshold}")
         return
 
     if paused:
@@ -1156,8 +1160,15 @@ def score_politicians():
     summaries.sort(key=lambda x: -x["total_trades"])
     summaries = summaries[:25]
 
-    with _lock:
-        prior = {k: v.get("score", 0) for k, v in state["politician_scores"].items()}
+    # Embed each politician's prior score directly in their summary entry so
+    # Claude sees it alongside the trade data, not in a separate block.
+    for s in summaries:
+        s["prior_score"] = existing_scores.get(s["name"], {}).get("score", None)
+
+    # Use a lower threshold during recess when fresh PTR data is sparse.
+    active_threshold = RECESS_THRESHOLD if fresh_ct < 5 else MIN_POLITICIAN_SCORE
+    if active_threshold != MIN_POLITICIAN_SCORE:
+        log.info(f"Recess mode: using threshold {active_threshold} (only {fresh_ct} fresh PTRs)")
 
     prompt = f"""You are evaluating US Congress member stock disclosures to score their predictive value for copy-trading.
 
@@ -1174,11 +1185,10 @@ Key scoring factors:
 4. Known high-signal politicians: Nancy Pelosi, Brian Mast, Michael McCaul, Dan Crenshaw, Tommy Tuberville
 5. Ratio of buys to sells (active buyers > pure sellers)
 
-Recent activity to score (last 90 days):
-{json.dumps(summaries, indent=2)}
+Each entry includes a prior_score field — use it as an anchor. Scores should not shift more than ~15 points without new data supporting the change.
 
-Prior scores for context:
-{json.dumps(prior, indent=2)}
+Politicians to score (last 90 days of activity; prior_score = last known score):
+{json.dumps(summaries, indent=2)}
 
 IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no explanation, no text before or after. Start your response with {{ and end with }}.
 
@@ -1233,13 +1243,16 @@ IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no exp
                     "trade_count_90d":     trade_count,
                 }
             state["last_score_refresh"] = now_iso
+            state["active_threshold"]   = active_threshold
             save_state()
 
-        above = sum(1 for v in scores_out.values() if int(v.get("score", 0)) >= MIN_POLITICIAN_SCORE)
-        log.info(f"Scored {len(scores_out)} politicians — {above} above threshold ({MIN_POLITICIAN_SCORE})")
+        above = sum(1 for v in scores_out.values() if int(v.get("score", 0)) >= active_threshold)
+        log.info(f"Scored {len(scores_out)} politicians — {above} above threshold ({active_threshold})")
+        if above == 0:
+            log.warning(f"0 politicians above threshold — Claude raw response (first 500): {raw_text[:500]!r}")
         tg_send(
             f"📊 <b>Politician scores updated</b>\n"
-            f"{above}/{len(scores_out)} politicians above threshold ({MIN_POLITICIAN_SCORE})\n"
+            f"{above}/{len(scores_out)} politicians above threshold ({active_threshold})\n"
             f"Send /scores for full list"
         )
 
@@ -1491,7 +1504,7 @@ def dashboard():
 
     tracked = sum(
         1 for v in s.get("politician_scores", {}).values()
-        if v.get("score", 0) >= MIN_POLITICIAN_SCORE
+        if v.get("score", 0) >= s.get("active_threshold", MIN_POLITICIAN_SCORE)
     )
 
     d = type("D", (), {
