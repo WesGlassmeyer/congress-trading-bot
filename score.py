@@ -634,8 +634,18 @@ IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no exp
             trade_count = next(
                 (s["total_trades"] for s in summaries if s["name"] == pol), 0
             )
+            raw_score = int(info.get("score", 0))
+            prior_score = existing_scores.get(pol, {}).get("score", None)
+            if prior_score is not None:
+                floor = max(0, prior_score - 15)
+                if raw_score < floor:
+                    log.warning(
+                        f"Score floor enforced for {pol}: "
+                        f"Claude returned {raw_score}, floor={floor} (prior={prior_score}) — clamping to {floor}"
+                    )
+                    raw_score = floor
             state["politician_scores"][pol] = {
-                "score":               int(info.get("score", 0)),
+                "score":               raw_score,
                 "reasoning":           info.get("reasoning", ""),
                 "committee_relevance": info.get("committee_relevance", "unknown"),
                 "last_scored":         now_iso,
