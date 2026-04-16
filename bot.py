@@ -1067,18 +1067,26 @@ def _close_position(ticker: str, pos: dict, exit_price: float, reason: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLAUDE POLITICIAN SCORING
 
-def _tickers_from_seen_ids(seen_ids: list[str]) -> dict[str, list[str]]:
-    """Parse politician → sorted ticker list from quiver seed IDs.
+def _quiver_tickers_for(politician: str, seen_ids: list[str]) -> list[str]:
+    """Return up to 10 tickers for one politician from quiver_ seed IDs.
 
-    ID format: quiver_{politician name}_{TICKER}_{date}
-    Returns a dict mapping politician name → sorted unique ticker list.
+    Processes only quiver_-prefixed entries one at a time — no full map
+    is built in memory. Stops collecting once 10 unique tickers are found.
     """
-    pol_tickers: dict[str, set[str]] = {}
+    tickers: set[str] = set()
+    prefix = f"quiver_{politician}_"
     for tid in seen_ids:
-        m = re.match(r"quiver_(.+?)_([A-Z]{1,5})_", tid)
-        if m:
-            pol_tickers.setdefault(m.group(1), set()).add(m.group(2))
-    return {pol: sorted(tickers) for pol, tickers in pol_tickers.items()}
+        if not tid.startswith("quiver_"):
+            continue
+        if tid.startswith(prefix):
+            # ID format: quiver_{name}_{TICKER}_{date}
+            rest = tid[len(prefix):]
+            m = re.match(r"([A-Z]{1,5})_", rest)
+            if m:
+                tickers.add(m.group(1))
+                if len(tickers) >= 10:
+                    break
+    return sorted(tickers)
 # ══════════════════════════════════════════════════════════════════════════════
 def score_politicians():
     """Use Claude to score active politicians based on their recent trade history.
@@ -1089,10 +1097,10 @@ def score_politicians():
     """
     log.info("Refreshing politician scores via Claude...")
 
-    # ── Load existing scores and build ticker history from seed data ─────────
+    # ── Load existing scores; seen_trade_ids queried per-politician later ────
     with _lock:
         existing_scores = dict(state.get("politician_scores", {}))
-        seed_tickers    = _tickers_from_seen_ids(state.get("seen_trade_ids", []))
+        seen_ids_snap   = list(state.get("seen_trade_ids", []))
 
     # ── Build fresh-data summaries from any available disclosures ────────────
     fresh_summaries: dict[str, dict] = {}   # keyed by politician name
@@ -1130,7 +1138,7 @@ def score_politicians():
                 "total_trades": len(trades),
                 "buys":         len(buys),
                 "sells":        len(sells),
-                "tickers":      tickers[:15],
+                "tickers":      tickers[:10],
                 "avg_value":    round(avg_val),
             }
 
@@ -1150,7 +1158,7 @@ def score_politicians():
                     "total_trades": trade_count,
                     "buys":         trade_count,
                     "sells":        0,
-                    "tickers":      seed_tickers.get(pol, [])[:15],
+                    "tickers":      _quiver_tickers_for(pol, seen_ids_snap),
                     "avg_value":    0,
                     "data_note":    "no recent filings — scored from historical trade count",
                 }
@@ -1170,9 +1178,9 @@ def score_politicians():
     hist_ct  = len(summaries) - fresh_ct
     log.info(f"Scoring pool: {len(summaries)} politicians ({fresh_ct} with fresh PTRs, {hist_ct} from historical data)")
 
-    # Sort by activity; cap at 25 politicians per call to avoid truncated JSON
+    # Sort by activity; cap at 20 politicians per call to limit memory + tokens
     summaries.sort(key=lambda x: -x["total_trades"])
-    summaries = summaries[:25]
+    summaries = summaries[:20]
 
     # Embed prior score AND an explicit floor in each entry so Claude has a
     # concrete lower bound to reason against, not just a soft anchor.
@@ -1227,7 +1235,7 @@ IMPORTANT: Return ONLY a raw JSON object. No markdown fences, no ```json, no exp
     try:
         response = _ai.messages.create(
             model="claude-opus-4-6",
-            max_tokens=4096,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw_text = response.content[0].text.strip()
